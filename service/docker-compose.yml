@@ -1,0 +1,20 @@
+services:
+  ranking-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: instagram-ranking-api
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      HF_HOME: "/app/.cache/huggingface"
+      TRANSFORMERS_CACHE: "/app/.cache/huggingface"
+
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./hf_cache:/app/.cache/huggingface
+
+    restart: unless-stopped
