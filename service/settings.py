@@ -1,30 +1,24 @@
 import os
 from pathlib import Path
 
+MODEL_NAME = os.getenv("MODEL_NAME", "BAAI/bge-m3")
 
-class EmbedderSettings:
-    model_name = os.getenv("EMBEDDER_MODEL_NAME", "BAAI/bge-m3")
-    normalize_embeddings = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
+CATBOOST_PATH = Path(
+    os.getenv("CATBOOST_PATH", "artifacts/catboost_soft_labels.cbm")
+)
 
+ACCOUNT_FEATURES_PATH = Path(
+    os.getenv("ACCOUNT_FEATURES_PATH", "artifacts/account_features_for_catboost.pkl")
+)
 
-embedder_settings = EmbedderSettings()
+TOP_K = int(os.getenv("TOP_K", "10"))
 
+# Новый параметр: сначала берём top-30 по cosine similarity
+CANDIDATE_TOP_K = int(os.getenv("CANDIDATE_TOP_K", "30"))
 
-class RerankSettings:
-    catboost_path = Path(os.getenv("RERANK_CATBOOST_PATH", "artifacts/catboost_soft_labels.cbm"))
-    top_k = int(os.getenv("RANK_TOP", 10))
+NORMALIZE_EMBEDDINGS = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
 
-
-rerank_settings = RerankSettings()
-
-
-class KnowledgeBase:
-    base_path = Path(os.getenv("KNOWLEDGE_BASE_PATH", "artifacts/account_features_for_catboost.pkl"))
-    campaign_template_path = os.getenv("CAMPAIGN_TEMPLATE_PATH", "artifacts/campaign_template.txt")
-
-    def __init__(self):
-        with open(self.campaign_template_path, 'r', encoding='utf-8') as file:
-            self.campaign_template = file.read()
-
-
-knowledge_base = KnowledgeBase()
+CAMPAIGN_TEMPLATE = """Рекламируемый продукт или предоставляемая услуга в рамках кампании: {product}.
+Требуемый формат видеопроизводства и тип интеграционного ролика: {video_format}.
+Желаемая манера подачи контента, стиль коммуникации и Tone of Voice (ToV): {tone_of_voice}.
+Полное описание рекламной кампании, цели интеграции, техническое задание и бриф для ИИ: {brief}."""

@@ -1,8 +1,7 @@
-import pandas as pd
-from typing import Optional, Any
+from typing import Any
+
 import numpy as np
-from base_models import *
-from settings import *
+import pandas as pd
 from catboost import Pool
 
 
@@ -22,7 +21,7 @@ def none_if_nan(x: Any):
     return x
 
 
-def safe_float(x: Any) -> Optional[float]:
+def safe_float(x: Any):
     x = none_if_nan(x)
 
     if x is None:
@@ -35,12 +34,6 @@ def safe_float(x: Any) -> Optional[float]:
 
 
 def to_vec(x: Any) -> np.ndarray:
-    """
-    Поддерживает:
-    - np.ndarray
-    - list / tuple
-    - строку вида '[0.1 0.2 ...]'
-    """
     if isinstance(x, np.ndarray):
         return x.astype(float)
 
@@ -93,41 +86,9 @@ def embedding_features(campaign_emb: np.ndarray, profile_emb: Any) -> dict[str, 
     }
 
 
-def render_campaign_text(req: RankingRequest) -> str:
-    return knowledge_base.campaign_template.format(
-        product=req.product.strip(),
-        video_format=(req.video_format or "").strip(),
-        tone_of_voice=(req.tone_of_voice or "").strip(),
-        brief=(req.brief or "").strip(),
-    )
-
-
-def encode_campaign(text: str, state) -> np.ndarray:
-    emb = state.embedder.encode(
-        text,
-        normalize_embeddings=embedder_settings.normalize_embeddings,
-        show_progress_bar=False,
-    )
-
-    return np.asarray(emb, dtype=float)
-
-
-def get_model_feature_names(model: CatBoostClassifier) -> list[str]:
-    names = model.feature_names_
-
-    if names is None or len(names) == 0:
-        raise RuntimeError(
-            "В CatBoost-модели нет feature_names_. "
-            "Модель нужно было обучать на Pool/DataFrame с именами колонок."
-        )
-
-    return list(names)
-
-
 def prepare_accounts_df(raw_accounts: pd.DataFrame) -> pd.DataFrame:
     accounts = raw_accounts.copy()
 
-    # Нормализуем самые важные названия, если где-то сохранились старые.
     rename_map = {
         "username": "blogger_username",
         "full_name": "blogger_full_name",
@@ -135,6 +96,9 @@ def prepare_accounts_df(raw_accounts: pd.DataFrame) -> pd.DataFrame:
         "embedding": "profile_embedding",
         "vibe": "blogger_vibe",
         "brands": "blogger_brands",
+        "domain": "blogger_domain",
+        "visual_style": "blogger_visual_style",
+        "audio_and_delivery": "blogger_audio_and_delivery",
         "profile_url": "link",
     }
 
@@ -142,21 +106,21 @@ def prepare_accounts_df(raw_accounts: pd.DataFrame) -> pd.DataFrame:
         if old in accounts.columns and new not in accounts.columns:
             accounts = accounts.rename(columns={old: new})
 
-    if "profile_embedding" not in accounts.columns:
-        raise RuntimeError("В account_features_for_catboost.pkl нет колонки profile_embedding")
+    required_cols = [
+        "profile_embedding",
+        "blogger_username",
+    ]
 
-    if "blogger_username" not in accounts.columns:
-        raise RuntimeError("В account_features_for_catboost.pkl нет колонки blogger_username")
+    for col in required_cols:
+        if col not in accounts.columns:
+            raise RuntimeError(f"В account_features_for_catboost.pkl нет колонки {col}")
 
-    # Link для выдачи:
-    # приоритет: link из insts.json, потом json_profile_url.
     if "link" not in accounts.columns:
         if "json_profile_url" in accounts.columns:
             accounts["link"] = accounts["json_profile_url"]
         else:
             accounts["link"] = np.nan
 
-    # ERR aliases.
     if "user_ERR" not in accounts.columns:
         if "ERR" in accounts.columns:
             accounts["user_ERR"] = accounts["ERR"]
@@ -165,9 +129,6 @@ def prepare_accounts_df(raw_accounts: pd.DataFrame) -> pd.DataFrame:
         else:
             accounts["user_ERR"] = np.nan
 
-    # viral_koef:
-    # если уже есть — используем.
-    # если нет — считаем как avg_views / followers.
     if "viral_koef" not in accounts.columns:
         if "avg_views" in accounts.columns and "blogger_followers" in accounts.columns:
             followers = pd.to_numeric(accounts["blogger_followers"], errors="coerce")
@@ -176,43 +137,103 @@ def prepare_accounts_df(raw_accounts: pd.DataFrame) -> pd.DataFrame:
         else:
             accounts["viral_koef"] = np.nan
 
+    # Защита для новых возвращаемых полей
+    for col in [
+        "blogger_audio_and_delivery",
+        "blogger_domain",
+        "blogger_visual_style",
+        "blogger_brands",
+        "blogger_vibe",
+    ]:
+        if col not in accounts.columns:
+            accounts[col] = np.nan
+
     return accounts
 
 
-def build_inference_frame(req: RankingRequest, campaign_emb: np.ndarray, state) -> pd.DataFrame:
-    accounts = state.accounts.copy()
+def add_cosine_retrieval_features(
+    accounts: pd.DataFrame,
+    campaign_emb: np.ndarray,
+) -> pd.DataFrame:
+    """
+    Считает cosine similarity для всех блогеров.
+    Потом можно взять top-N.
+    """
+    out = accounts.copy()
 
-    # Campaign-level фичи.
-    accounts["campaign_product"] = req.product or ""
-    accounts["campaign_video_format"] = req.video_format or ""
-    accounts["campaign_tov"] = req.tone_of_voice or ""
-    accounts["campaign_brief"] = req.brief or ""
-    accounts["campaign_text"] = render_campaign_text(req)
+    campaign_vec = to_vec(campaign_emb)
+    campaign_norm = np.linalg.norm(campaign_vec)
+
+    similarities = []
+
+    for profile_emb in out["profile_embedding"]:
+        profile_vec = to_vec(profile_emb)
+        profile_norm = np.linalg.norm(profile_vec)
+
+        sim = float(
+            np.dot(campaign_vec, profile_vec)
+            / (campaign_norm * profile_norm + 1e-12)
+        )
+
+        similarities.append(sim)
+
+    out["cosine_similarity"] = similarities
+    out["cosine_distance"] = 1 - out["cosine_similarity"]
+
+    out = out.sort_values(
+        "cosine_similarity",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    out["cosine_rank"] = np.arange(1, len(out) + 1)
+
+    # Если CatBoost обучался на score/rank, теперь честно заполняем их retrieval-значениями
+    out["score"] = out["cosine_similarity"]
+    out["rank"] = out["cosine_rank"]
+
+    return out
+
+
+def build_pair_features_for_candidates(
+    candidates: pd.DataFrame,
+    campaign_emb: np.ndarray,
+    product: str,
+    video_format: str,
+    tone_of_voice: str,
+    brief: str,
+    rendered_campaign_text: str,
+) -> pd.DataFrame:
+    pairs = candidates.copy()
+
+    pairs["campaign_product"] = product or ""
+    pairs["campaign_video_format"] = video_format or ""
+    pairs["campaign_tov"] = tone_of_voice or ""
+    pairs["campaign_brief"] = brief or ""
+    pairs["campaign_text"] = rendered_campaign_text
 
     emb_features_df = pd.DataFrame(
         [
             embedding_features(campaign_emb, profile_emb)
-            for profile_emb in accounts["profile_embedding"]
+            for profile_emb in pairs["profile_embedding"]
         ],
-        index=accounts.index,
+        index=pairs.index,
     )
 
     pairs = pd.concat(
-        [accounts.reset_index(drop=True), emb_features_df.reset_index(drop=True)],
+        [pairs.reset_index(drop=True), emb_features_df.reset_index(drop=True)],
         axis=1,
     )
 
     return pairs
 
 
-def prepare_catboost_matrix(pairs: pd.DataFrame, state) -> Pool:
-    feature_names = state.model_feature_names
-    cat_feature_indices = state.cat_feature_indices or []
-
+def prepare_catboost_pool(
+    pairs: pd.DataFrame,
+    feature_names: list[str],
+    cat_feature_indices: list[int],
+) -> Pool:
     X = pairs.copy()
 
-    # Добавляем отсутствующие фичи.
-    # Если модель случайно ждёт score/rank из старого train — дадим NaN, чтобы сервис не падал.
     for col in feature_names:
         if col not in X.columns:
             X[col] = np.nan
